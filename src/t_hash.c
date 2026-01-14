@@ -1606,8 +1606,6 @@ void hsetexCommand(client *c) {
             if (expire) {
                 notifyKeyspaceEvent(NOTIFY_HASH, "hexpire", c->argv[1], c->db->id);
             }
-
-            
         }
         signalModifiedKey(c, c->db, c->argv[1]);
         server.dirty += changes;
