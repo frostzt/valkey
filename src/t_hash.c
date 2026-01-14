@@ -1430,6 +1430,7 @@ void hsetexCommand(client *c) {
         }
     }
 
+    bool expired_overwritten = false;
     for (i = fields_index; i < c->argc; i += 2) {
         if (set_expired) {
             if (hashTypeDelete(o, objectGetVal(c->argv[i]))) {
@@ -1440,7 +1441,7 @@ void hsetexCommand(client *c) {
                 changes++;
             }
         } else {
-            hashTypeSet(o, objectGetVal(c->argv[i]), objectGetVal(c->argv[i + 1]), when, set_flags, NULL);
+            hashTypeSet(o, objectGetVal(c->argv[i]), objectGetVal(c->argv[i + 1]), when, set_flags, &expired_overwritten);
             changes++;
             if (need_rewrite_argv) {
                 new_argv[new_argc++] = c->argv[i];
@@ -1471,6 +1472,13 @@ void hsetexCommand(client *c) {
         }
         signalModifiedKey(c, c->db, c->argv[1]);
         server.dirty += changes;
+        /* If we overwrote an expired field we'll act as if it was expired */
+        if (expired_overwritten) {
+            server.stat_expiredfields++;
+            incrRefCount(c->argv[1]);
+            propagateFieldsDeletion(c->db, o, 1, &c->argv[1], c->db->id);
+            notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
+        }
     } else {
         /* If no changes were done we still need to free the new argv array and the refcount of the first argument. */
         if (set_expired)
