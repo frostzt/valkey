@@ -1357,7 +1357,6 @@ void hsetexCommand(client *c) {
     int need_rewrite_argv = 0;
 
     robj **keepttl_fields = NULL;
-    robj **keepttl_values = NULL;
     int keepttl_count = 0;
 
     for (; fields_index < c->argc - 1; fields_index++) {
@@ -1471,7 +1470,6 @@ void hsetexCommand(client *c) {
      * to propagate them individually with their actual timestamps */
     if ((flags & ARGS_KEEPTTL) && has_volatile_fields) {
         keepttl_fields = zmalloc(sizeof(robj *) * num_fields);
-        keepttl_values = zmalloc(sizeof(robj *) * num_fields);
     }
 
     for (i = fields_index; i < c->argc; i += 2) {
@@ -1492,8 +1490,6 @@ void hsetexCommand(client *c) {
             if ((flags & ARGS_KEEPTTL) && has_volatile_fields) {
                 keepttl_fields[keepttl_count] = c->argv[i];
                 incrRefCount(c->argv[i]);
-                keepttl_fields[keepttl_count] = c->argv[i + 1];
-                incrRefCount(c->argv[i + 1]);
                 keepttl_count++;
             } else if (need_rewrite_argv) {
                 new_argv[new_argc++] = c->argv[i];
@@ -1517,90 +1513,26 @@ void hsetexCommand(client *c) {
                 server.stat_expiredfields += expired_overriten;
                 notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
             }
-            notifyKeyspaceEvent(NOTIFY_HASH, "hset", c->argv[1], c->db->id);
 
+            /* Propagate deletions for expired/non-existent fields in batches */
             if ((flags & ARGS_KEEPTTL) && has_volatile_fields && keepttl_count > 0) {
-                for (int i = 0; i < keepttl_count; i++) {
-                    sds field = objectGetVal(keepttl_fields[i]);
-                    long long field_expiry = EXPIRY_NONE;
-
-                    int expiry_result = hashTypeGetExpiry(o, field, &field_expiry);
-                    if (expiry_result == C_ERR || timestampIsExpired(field_expiry)) {
-                        /* This field does not exist or is expired */
-                        robj *del_argv[3];
-                        del_argv[0] = shared.hdel;
-                        del_argv[1] = c->argv[1];
-                        incrRefCount(c->argv[1]);
-                        del_argv[2] = keepttl_fields[i];
-                        incrRefCount(keepttl_fields[i]);
-
-                        if (i == 0) {
-                            /* Replace the orig command for first */
-                            replaceClientCommandVector(c, 3, del_argv);
-                        } else {
-                            /* Subsequent ones will use alsoPropagate */
-                            alsoPropagate(c->db->id, del_argv, 3, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
-                            /* Cleanup the above refCounts for alsoPropagate */
-                            decrRefCount(del_argv[1]);
-                            decrRefCount(del_argv[2]);
-                        }
-                    } else if (field_expiry != EXPIRY_NONE) {
-                        /* Field exists with expiry we will propagate this as HSETEX with PXAT */
-                        int new_argc = 8;
-                        robj *field_argv[new_argc];
-                        robj *milliseconds_obj = createStringObjectFromLongLong(field_expiry);
-
-                        field_argv[0] = shared.hsetex;
-                        field_argv[1] = c->argv[1];
-                        incrRefCount(c->argv[1]);
-                        field_argv[2] = shared.pxat;
-                        field_argv[3] = milliseconds_obj;
-                        field_argv[4] = shared.fields;
-                        field_argv[5] = shared.integers[1];
-                        field_argv[6] = keepttl_fields[i];
-                        field_argv[7] = keepttl_values[i];
-
-                        if (i == 0) {
-                            /* Replace the orig command for first */
-                            replaceClientCommandVector(c, new_argc, field_argv);
-                        } else {
-                            /* Subsequent ones will use alsoPropagate */
-                            alsoPropagate(c->db->id, field_argv, new_argc, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
-                            /* Cleanup the above refCounts for alsoPropagate */
-                            decrRefCount(field_argv[1]);
-                            decrRefCount(field_argv[3]);
-                        }
-                    } else {
-                        /* Field exists without expiry we will propagate this as HSET */
-                        int new_argc = 4;
-                        robj *field_argv[new_argc];
-                        field_argv[0] = shared.hset;
-                        field_argv[1] = c->argv[1];
-                        incrRefCount(c->argv[1]);
-                        field_argv[2] = keepttl_fields[i];
-                        field_argv[3] = keepttl_values[i];
-
-                        if (i == 0) {
-                            /* Replace the orig command for first */
-                            replaceClientCommandVector(c, new_argc, field_argv);
-                        } else {
-                            /* Subsequent ones will use alsoPropagate */
-                            alsoPropagate(c->db->id, field_argv, new_argc, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
-                            /* Cleanup the above refCounts for alsoPropagate */
-                            decrRefCount(field_argv[1]);
-                        }
-                    }
+                int idx = 0;
+                while (idx < keepttl_count) {
+                    int propagated = propagateFieldsDeletion(c->db, o, keepttl_count - idx,
+                                                             &keepttl_fields[idx], c->slot);
+                    idx += propagated;
                 }
 
                 for (int i = 0; i < keepttl_count; i++) {
                     decrRefCount(keepttl_fields[i]);
-                    decrRefCount(keepttl_values[i]);
                 }
                 zfree(keepttl_fields);
-                zfree(keepttl_values);
                 keepttl_fields = NULL;
-                keepttl_values = NULL;
-            } else if (need_rewrite_argv) {
+            }
+
+            notifyKeyspaceEvent(NOTIFY_HASH, "hset", c->argv[1], c->db->id);
+
+            if (need_rewrite_argv) {
                 replaceClientCommandVector(c, new_argc, new_argv);
             }
             if (expire) {
@@ -1618,10 +1550,8 @@ void hsetexCommand(client *c) {
         if (keepttl_fields) {
             for (int i = 0; i < keepttl_count; i++) {
                 decrRefCount(keepttl_fields[i]);
-                decrRefCount(keepttl_values[i]);
             }
             zfree(keepttl_fields);
-            zfree(keepttl_values);
         }
     }
 
