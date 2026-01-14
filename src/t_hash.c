@@ -1616,6 +1616,15 @@ void hsetexCommand(client *c) {
         if (set_expired)
             decrRefCount(c->argv[1]);
         if (new_argv) zfree(new_argv);
+
+        if (keepttl_fields) {
+            for (int i = 0; i < keepttl_count; i++) {
+                decrRefCount(keepttl_fields[i]);
+                decrRefCount(keepttl_values[i]);
+            }
+            zfree(keepttl_fields);
+            zfree(keepttl_values);
+        }
     }
 
     /* Delete the object in case it was left empty or created with all expired items. */
