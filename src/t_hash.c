@@ -1465,13 +1465,6 @@ void hsetexCommand(client *c) {
     }
 
     int expired_overriten = 0;
-
-    /* When KEEPTTL is used with volatile fields, we need to track all fields
-     * to propagate them individually with their actual timestamps */
-    if ((flags & ARGS_KEEPTTL) && has_volatile_fields) {
-        keepttl_fields = zmalloc(sizeof(robj *) * num_fields);
-    }
-
     for (i = fields_index; i < c->argc; i += 2) {
         if (set_expired) {
             if (hashTypeDelete(o, objectGetVal(c->argv[i]))) {
@@ -1487,7 +1480,12 @@ void hsetexCommand(client *c) {
             if (expired) expired_overriten++;
             changes++;
 
-            if ((flags & ARGS_KEEPTTL) && has_volatile_fields) {
+            /* When KEEPTTL is used, we need to track all fields to propagate them
+             * individually with their actual timestamps */
+            if ((flags & ARGS_KEEPTTL) && expired) {
+                if (keepttl_fields == NULL) {
+                    keepttl_fields = zmalloc(sizeof(robj *) * num_fields);
+                }
                 keepttl_fields[keepttl_count] = c->argv[i];
                 incrRefCount(c->argv[i]);
                 keepttl_count++;
@@ -1509,18 +1507,16 @@ void hsetexCommand(client *c) {
             /* We would like to reduce the number of hexpired events in case there are potential many expired fields. */
             notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
         } else {
-            if (expired_overriten) {
+            /* Propagate deletions for expired/non-existent fields in batches */
+            if (keepttl_count > 0) {
                 server.stat_expiredfields += expired_overriten;
                 notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
-            }
 
-            /* Propagate deletions for expired/non-existent fields in batches */
-            if ((flags & ARGS_KEEPTTL) && has_volatile_fields && keepttl_count > 0) {
+                /* Propagate individual fields deletions */
                 int idx = 0;
                 while (idx < keepttl_count) {
-                    int propagated = propagateFieldsDeletion(c->db, o, keepttl_count - idx,
+                    idx += propagateFieldsDeletion(c->db, o, keepttl_count - idx,
                                                              &keepttl_fields[idx], c->slot);
-                    idx += propagated;
                 }
 
                 for (int i = 0; i < keepttl_count; i++) {
@@ -1547,12 +1543,7 @@ void hsetexCommand(client *c) {
             decrRefCount(c->argv[1]);
         if (new_argv) zfree(new_argv);
 
-        if (keepttl_fields) {
-            for (int i = 0; i < keepttl_count; i++) {
-                decrRefCount(keepttl_fields[i]);
-            }
-            zfree(keepttl_fields);
-        }
+        serverAssert(keepttl_fields == NULL);
     }
 
     /* Delete the object in case it was left empty or created with all expired items. */
