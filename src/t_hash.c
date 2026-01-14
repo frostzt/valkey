@@ -1476,7 +1476,6 @@ void hsetexCommand(client *c) {
         } else {
             bool expired;
             hashTypeSet(o, objectGetVal(c->argv[i]), objectGetVal(c->argv[i + 1]), when, set_flags, &expired);
-            if (expired) expired_overriten++;
             changes++;
 
             /* When KEEPTTL is used, we need to track all fields to propagate them
@@ -1493,6 +1492,8 @@ void hsetexCommand(client *c) {
                 new_argv[new_argc++] = c->argv[i + 1];
                 incrRefCount(c->argv[i + 1]);
             }
+
+            if (expired) expired_overriten++;
         }
     }
 

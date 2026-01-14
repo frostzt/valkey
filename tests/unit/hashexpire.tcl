@@ -4639,7 +4639,7 @@ start_server {tags {"hashexpire external:skip"}} {
             assert_equal {5} [$primary hlen myhash]
             assert_equal {5} [$replica hlen myhash]
             assert_equal {} [$replica hgetall myhash]
-        
+
             $primary hmset myhash f1 v1 f2 v2 f3 v3 f4 v4 f5 v5
 
             wait_for_ofs_sync $primary $replica
@@ -4647,6 +4647,35 @@ start_server {tags {"hashexpire external:skip"}} {
             assert_equal [$primary hgetall myhash] [$replica hgetall myhash]
             assert_keyevent_patterns $primary_ksn myhash hset hexpire hexpired hset
             assert_keyevent_patterns $replica_ksn myhash hset hexpire hexpired hset
+            $primary debug set-active-expire 1
+        } {OK} {needs:debug}
+
+        test {HSETEX KEEPTTL propagates HDEL for expired field to replica} {
+            lassign [setup_replication_test $primary $replica $primary_host $primary_port] primary_initial_expired replica_initial_expired
+
+            $primary debug set-active-expire 0
+            $primary flushall
+
+            $primary hsetex myhash EX 3 FIELDS 1 f1 v1
+            wait_for_ofs_sync $primary $replica
+
+            assert_equal {f1 v1} [$primary hgetall myhash]
+            assert_equal {f1 v1} [$replica hgetall myhash]
+
+            wait_for_condition 50 100 {
+                [$primary hexists myhash f1] == 0
+            } else {
+                fail "Field did not expire on primary"
+            }
+
+            $primary hsetex myhash KEEPTTL FIELDS 1 f1 v2
+            wait_for_ofs_sync $primary $replica
+
+            assert_equal {} [$primary hgetall myhash]
+            assert_equal [$primary hgetall myhash] [$replica hgetall myhash]
+
+            assert_equal [expr {$primary_initial_expired + 1}] [info_field [$primary info stats] expired_fields]
+
             $primary debug set-active-expire 1
         } {OK} {needs:debug}
     }
