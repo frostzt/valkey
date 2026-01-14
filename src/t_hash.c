@@ -1356,6 +1356,10 @@ void hsetexCommand(client *c) {
     int new_argc = 0;
     int need_rewrite_argv = 0;
 
+    robj **keepttl_fields = NULL;
+    robj **keepttl_values = NULL;
+    int keepttl_count = 0;
+
     for (; fields_index < c->argc - 1; fields_index++) {
         if (!strcasecmp(objectGetVal(c->argv[fields_index]), "fields")) {
             /* checking optional flags */
@@ -1462,6 +1466,14 @@ void hsetexCommand(client *c) {
     }
 
     int expired_overriten = 0;
+
+    /* When KEEPTTL is used with volatile fields, we need to track all fields
+     * to propagate them individually with their actual timestamps */
+    if ((flags & ARGS_KEEPTTL) && has_volatile_fields) {
+        keepttl_fields = zmalloc(sizeof(robj *) * num_fields);
+        keepttl_values = zmalloc(sizeof(robj *) * num_fields);
+    }
+
     for (i = fields_index; i < c->argc; i += 2) {
         if (set_expired) {
             if (hashTypeDelete(o, objectGetVal(c->argv[i]))) {
@@ -1476,7 +1488,14 @@ void hsetexCommand(client *c) {
             hashTypeSet(o, objectGetVal(c->argv[i]), objectGetVal(c->argv[i + 1]), when, set_flags, &expired);
             if (expired) expired_overriten++;
             changes++;
-            if (need_rewrite_argv) {
+
+            if ((flags & ARGS_KEEPTTL) && has_volatile_fields) {
+                keepttl_fields[keepttl_count] = c->argv[i];
+                incrRefCount(c->argv[i]);
+                keepttl_fields[keepttl_count] = c->argv[i + 1];
+                incrRefCount(c->argv[i + 1]);
+                keepttl_count++;
+            } else if (need_rewrite_argv) {
                 new_argv[new_argc++] = c->argv[i];
                 incrRefCount(c->argv[i]);
                 new_argv[new_argc++] = c->argv[i + 1];
@@ -1484,7 +1503,6 @@ void hsetexCommand(client *c) {
             }
         }
     }
-
 
     if (changes) {
         if (has_volatile_fields != hashTypeHasVolatileFields(o)) {
@@ -1500,22 +1518,99 @@ void hsetexCommand(client *c) {
                 notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
             }
             notifyKeyspaceEvent(NOTIFY_HASH, "hset", c->argv[1], c->db->id);
-            if (need_rewrite_argv) {
+
+            if ((flags & ARGS_KEEPTTL) && has_volatile_fields && keepttl_count > 0) {
+                for (int i = 0; i < keepttl_count; i++) {
+                    sds field = objectGetVal(keepttl_fields[i]);
+                    long long field_expiry = EXPIRY_NONE;
+
+                    int expiry_result = hashTypeGetExpiry(o, field, &field_expiry);
+                    if (expiry_result == C_ERR || timestampIsExpired(field_expiry)) {
+                        /* This field does not exist or is expired */
+                        robj *del_argv[3];
+                        del_argv[0] = shared.hdel;
+                        del_argv[1] = c->argv[1];
+                        incrRefCount(c->argv[1]);
+                        del_argv[2] = keepttl_fields[i];
+                        incrRefCount(keepttl_fields[i]);
+
+                        if (i == 0) {
+                            /* Replace the orig command for first */
+                            replaceClientCommandVector(c, 3, del_argv);
+                        } else {
+                            /* Subsequent ones will use alsoPropagate */
+                            alsoPropagate(c->db->id, del_argv, 3, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
+                            /* Cleanup the above refCounts for alsoPropagate */
+                            decrRefCount(del_argv[1]);
+                            decrRefCount(del_argv[2]);
+                        }
+                    } else if (field_expiry != EXPIRY_NONE) {
+                        /* Field exists with expiry we will propagate this as HSETEX with PXAT */
+                        int new_argc = 8;
+                        robj *field_argv[new_argc];
+                        robj *milliseconds_obj = createStringObjectFromLongLong(field_expiry);
+
+                        field_argv[0] = shared.hsetex;
+                        field_argv[1] = c->argv[1];
+                        incrRefCount(c->argv[1]);
+                        field_argv[2] = shared.pxat;
+                        field_argv[3] = milliseconds_obj;
+                        field_argv[4] = shared.fields;
+                        field_argv[5] = shared.integers[1];
+                        field_argv[6] = keepttl_fields[i];
+                        field_argv[7] = keepttl_values[i];
+
+                        if (i == 0) {
+                            /* Replace the orig command for first */
+                            replaceClientCommandVector(c, new_argc, field_argv);
+                        } else {
+                            /* Subsequent ones will use alsoPropagate */
+                            alsoPropagate(c->db->id, field_argv, new_argc, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
+                            /* Cleanup the above refCounts for alsoPropagate */
+                            decrRefCount(field_argv[1]);
+                            decrRefCount(field_argv[3]);
+                        }
+                    } else {
+                        /* Field exists without expiry we will propagate this as HSET */
+                        int new_argc = 4;
+                        robj *field_argv[new_argc];
+                        field_argv[0] = shared.hset;
+                        field_argv[1] = c->argv[1];
+                        incrRefCount(c->argv[1]);
+                        field_argv[2] = keepttl_fields[i];
+                        field_argv[3] = keepttl_values[i];
+
+                        if (i == 0) {
+                            /* Replace the orig command for first */
+                            replaceClientCommandVector(c, new_argc, field_argv);
+                        } else {
+                            /* Subsequent ones will use alsoPropagate */
+                            alsoPropagate(c->db->id, field_argv, new_argc, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
+                            /* Cleanup the above refCounts for alsoPropagate */
+                            decrRefCount(field_argv[1]);
+                        }
+                    }
+                }
+
+                for (int i = 0; i < keepttl_count; i++) {
+                    decrRefCount(keepttl_fields[i]);
+                    decrRefCount(keepttl_values[i]);
+                }
+                zfree(keepttl_fields);
+                zfree(keepttl_values);
+                keepttl_fields = NULL;
+                keepttl_values = NULL;
+            } else if (need_rewrite_argv) {
                 replaceClientCommandVector(c, new_argc, new_argv);
             }
             if (expire) {
                 notifyKeyspaceEvent(NOTIFY_HASH, "hexpire", c->argv[1], c->db->id);
             }
+
+            
         }
         signalModifiedKey(c, c->db, c->argv[1]);
         server.dirty += changes;
-        /* If we overwrote an expired field we'll act as if it was expired */
-        if (expired_overwritten) {
-            server.stat_expiredfields++;
-            incrRefCount(c->argv[1]);
-            propagateFieldsDeletion(c->db, o, 1, &c->argv[1], c->db->id);
-            notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
-        }
     } else {
         /* If no changes were done we still need to free the new argv array and the refcount of the first argument. */
         if (set_expired)
