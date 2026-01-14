@@ -1357,7 +1357,7 @@ void hsetexCommand(client *c) {
     int need_rewrite_argv = 0;
 
     robj **keepttl_fields = NULL;
-    int keepttl_count = 0;
+    int expired_overriten = 0;
 
     for (; fields_index < c->argc - 1; fields_index++) {
         if (!strcasecmp(objectGetVal(c->argv[fields_index]), "fields")) {
@@ -1464,7 +1464,6 @@ void hsetexCommand(client *c) {
         }
     }
 
-    int expired_overriten = 0;
     for (i = fields_index; i < c->argc; i += 2) {
         if (set_expired) {
             if (hashTypeDelete(o, objectGetVal(c->argv[i]))) {
@@ -1486,9 +1485,8 @@ void hsetexCommand(client *c) {
                 if (keepttl_fields == NULL) {
                     keepttl_fields = zmalloc(sizeof(robj *) * num_fields);
                 }
-                keepttl_fields[keepttl_count] = c->argv[i];
+                keepttl_fields[expired_overriten] = c->argv[i];
                 incrRefCount(c->argv[i]);
-                keepttl_count++;
             } else if (need_rewrite_argv) {
                 new_argv[new_argc++] = c->argv[i];
                 incrRefCount(c->argv[i]);
@@ -1508,18 +1506,18 @@ void hsetexCommand(client *c) {
             notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
         } else {
             /* Propagate deletions for expired/non-existent fields in batches */
-            if (keepttl_count > 0) {
+            if (keepttl_fields != NULL) {
                 server.stat_expiredfields += expired_overriten;
                 notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
 
                 /* Propagate individual fields deletions */
                 int idx = 0;
-                while (idx < keepttl_count) {
-                    idx += propagateFieldsDeletion(c->db, o, keepttl_count - idx,
-                                                             &keepttl_fields[idx], c->slot);
+                while (idx < expired_overriten) {
+                    idx += propagateFieldsDeletion(c->db, o, expired_overriten - idx,
+                                                   &keepttl_fields[idx], c->slot);
                 }
 
-                for (int i = 0; i < keepttl_count; i++) {
+                for (int i = 0; i < expired_overriten; i++) {
                     decrRefCount(keepttl_fields[i]);
                 }
                 zfree(keepttl_fields);
