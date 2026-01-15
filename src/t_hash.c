@@ -1521,10 +1521,6 @@ void hsetexCommand(client *c) {
                     idx += propagateFieldsDeletion(c->db, o, expired_overriten - idx,
                                                    &keepttl_fields[idx], c->slot);
                 }
-
-                for (int i = 0; i < expired_overriten; i++) {
-                    decrRefCount(keepttl_fields[i]);
-                }
                 zfree(keepttl_fields);
                 keepttl_fields = NULL;
             }
