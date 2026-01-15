@@ -1508,11 +1508,13 @@ void hsetexCommand(client *c) {
             /* We would like to reduce the number of hexpired events in case there are potential many expired fields. */
             notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
         } else {
-            /* Propagate deletions for expired/non-existent fields in batches */
-            if (keepttl_fields != NULL) {
+            if (expired_overriten > 0) {
                 server.stat_expiredfields += expired_overriten;
                 notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", c->argv[1], c->db->id);
+            }
 
+            /* Propagate deletions for expired/non-existent fields in batches */
+            if (keepttl_fields != NULL) {
                 /* Propagate individual fields deletions */
                 int idx = 0;
                 while (idx < expired_overriten) {
