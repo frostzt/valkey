@@ -1486,7 +1486,9 @@ void hsetexCommand(client *c) {
                 }
                 keepttl_fields[expired_overriten] = c->argv[i];
                 incrRefCount(c->argv[i]);
-            } else if (need_rewrite_argv) {
+            } 
+
+            if (need_rewrite_argv) {
                 new_argv[new_argc++] = c->argv[i];
                 incrRefCount(c->argv[i]);
                 new_argv[new_argc++] = c->argv[i + 1];
